@@ -1,6 +1,7 @@
 //! Pre-release readiness checks.
 
 use crate::environment::{get_crate_dirs, quiet_println, CONFIG_FILE_PATH};
+use crate::quiet_cmd;
 use serde::Deserialize;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -66,6 +67,11 @@ pub fn run(sh: &Shell, packages: &[String]) -> Result<(), Box<dyn std::error::Er
             eprintln!("Pre-release check failed for {}: {}", crate_dir, e);
             return Err(e);
         }
+
+        if let Err(e) = check_crate(sh) {
+            eprintln!("Pre-release check failed for {}: {}", crate_dir, e);
+            return Err(e);
+        }
     }
 
     quiet_println("All pre-release checks passed");
@@ -113,4 +119,62 @@ fn check_todos(sh: &Shell) -> Result<(), Box<dyn std::error::Error>> {
 
     quiet_println("No TODO comments found");
     Ok(())
+}
+
+/// Check that the crate can be packaged and published.
+///
+/// A crate may work with local path dependencies, but fail when published
+/// because the version specifications don't match the published versions
+/// or don't resolve correctly.
+fn check_crate(sh: &Shell) -> Result<(), Box<dyn std::error::Error>> {
+    quiet_println("Running cargo package...");
+    quiet_cmd!(sh, "cargo package").run()?;
+    quiet_println("cargo package succeeded");
+
+    let (package_name, version) = get_package_info(sh)?;
+    let package_dir = format!("target/package/{}-{}", package_name, version);
+    quiet_println(&format!("Testing packaged crate in {}...", package_dir));
+
+    let _dir = sh.push_dir(&package_dir);
+    // Broad test to try and weed out any dependency issues.
+    quiet_cmd!(sh, "cargo test --all-features --all-targets").run()?;
+    quiet_println("Packaged crate tests passed");
+
+    Ok(())
+}
+
+/// Get the current package name and version from cargo metadata.
+fn get_package_info(sh: &Shell) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let metadata = xshell::cmd!(sh, "cargo metadata --no-deps --format-version 1").read()?;
+    let json: serde_json::Value = serde_json::from_str(&metadata)?;
+
+    // Find the package that matches the current directory.
+    let current_dir = sh.current_dir();
+    let current_manifest = current_dir.join("Cargo.toml");
+
+    let packages = json["packages"]
+        .as_array()
+        .ok_or("Missing 'packages' field in cargo metadata")?;
+
+    for package in packages {
+        let manifest_path = package["manifest_path"]
+            .as_str()
+            .ok_or("Missing manifest_path in package")?;
+
+        if manifest_path == current_manifest.to_str().ok_or("Invalid path")? {
+            let name = package["name"]
+                .as_str()
+                .ok_or("Missing name in package")?
+                .to_string();
+
+            let version = package["version"]
+                .as_str()
+                .ok_or("Missing version in package")?
+                .to_string();
+
+            return Ok((name, version));
+        }
+    }
+
+    Err("Could not find current package in cargo metadata".into())
 }
